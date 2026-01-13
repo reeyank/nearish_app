@@ -55,6 +55,11 @@ class NearishUser(Base):
     lastLongitude = Column(Float, nullable=True)
     lastLocationUpdate = Column(DateTime, nullable=True)
     
+    # Status
+    status_emoji = Column(String, nullable=True)
+    status_text = Column(String, nullable=True)
+    status_updated_at = Column(DateTime, nullable=True)
+    
     createdAt = Column(DateTime, default=datetime.now(timezone.utc))
     updatedAt = Column(DateTime, default=datetime.now(timezone.utc), onupdate=datetime.now(timezone.utc))
 
@@ -82,6 +87,12 @@ class Memory(Base):
     longitude = Column(Float, nullable=True)
     locationName = Column(String, nullable=True)
     createdAt = Column(DateTime, default=datetime.now(timezone.utc))
+
+class Games(Base):
+    __tablename__ = "games"
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    system_prompt = Column(String, nullable=True)
 
 # Create tables
 Base.metadata.create_all(bind=engine)
@@ -176,8 +187,76 @@ def get_me(user: User = Depends(get_current_user), db: Session = Depends(get_db)
         "better_auth_id": user.id,
         "name": user.name,
         "email": user.email,
-        "is_anonymous": user.isAnonymous
+        "is_anonymous": user.isAnonymous,
+        "status": {
+            "emoji": nearish_user.status_emoji,
+            "text": nearish_user.status_text,
+            "updatedAt": nearish_user.status_updated_at
+        }
     }
+
+@app.post("/api/status")
+async def update_status(payload: dict, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    nearish_user = get_nearish_user(user, db)
+    
+    emoji = payload.get("emoji")
+    text_status = payload.get("text")
+    
+    nearish_user.status_emoji = emoji
+    nearish_user.status_text = text_status
+    nearish_user.status_updated_at = datetime.now(timezone.utc)
+    
+    db.commit()
+    
+    # Notify partner
+    if nearish_user.partner_id:
+        await manager.send_event(nearish_user.partner_id, "partner_status_update", {
+            "emoji": emoji,
+            "text": text_status,
+            "updatedAt": nearish_user.status_updated_at.isoformat()
+        })
+        
+    return {"success": True}
+
+@app.get("/api/status/partner")
+def get_partner_status(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    me = get_nearish_user(user, db)
+    
+    if not me.partner_id:
+        return {"success": False, "message": "No partner connected"}
+        
+    partner = db.query(NearishUser).filter(NearishUser.id == me.partner_id).first()
+    
+    if not partner:
+        return {"success": False, "message": "Partner not found"}
+
+    # Calculate distance info here too, to keep it centralized for the UI
+    distance_str = None
+    dist_miles = None
+    
+    if me.lastLatitude is not None and me.lastLongitude is not None and \
+       partner.lastLatitude is not None and partner.lastLongitude is not None:
+        
+        dist_miles = haversine(me.lastLatitude, me.lastLongitude, partner.lastLatitude, partner.lastLongitude)
+        dist_miles = round(dist_miles, 2)
+        
+        if dist_miles < 0.5:
+            distance_str = "With You ❤️"
+        elif dist_miles < 5:
+            distance_str = "Nearby"
+        else:
+            distance_str = f"{dist_miles} miles away"
+
+    return {"success": True, "data": {
+        "emoji": partner.status_emoji,
+        "text": partner.status_text,
+        "updatedAt": partner.status_updated_at,
+        "location": {
+            "distanceStr": distance_str,
+            "distanceMiles": dist_miles,
+            "lastUpdated": partner.lastLocationUpdate
+        }
+    }}
 
 @app.post("/api/partner/code")
 def generate_code(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -508,8 +587,6 @@ def get_memories(user: User = Depends(get_current_user), db: Session = Depends(g
     if nearish_user.partner_id:
         user_ids.append(nearish_user.partner_id)
         
-    # Join with NearishUser and User to get the author's name
-    # Use outerjoin to ensure memories are returned even if user mapping is incomplete
     query = db.query(Memory, User.name).outerjoin(
         NearishUser, Memory.nearish_user_id == NearishUser.id
     ).outerjoin(
@@ -534,6 +611,10 @@ def get_memories(user: User = Depends(get_current_user), db: Session = Depends(g
         })
     
     return {"success": True, "data": results}
+
+@app.get("/api/games")
+def get_games(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    query = db.query()
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
