@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, Header, Request, UploadFile, File, Form
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, HTMLResponse
 from sqlalchemy import create_engine, Column, String, DateTime, Boolean, Integer, ForeignKey, Float, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
@@ -219,6 +219,18 @@ def get_nearish_user(user: User, db: Session):
         db.commit()
         db.refresh(nearish_user)
     return nearish_user
+
+def verify_admin(authorization: str = Header(None)):
+    admin_secret = os.getenv("ADMIN_SECRET", "nearish-admin-2026")
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization Header")
+    try:
+        scheme, token = authorization.split()
+        if scheme.lower() != 'bearer' or token != admin_secret:
+            raise HTTPException(status_code=401, detail="Invalid Admin Token")
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid Authorization Format")
+    return True
 
 # Helper to identify couple tuple
 def get_couple_ids(nearish_user: NearishUser):
@@ -1378,7 +1390,7 @@ def update_subscription_status(payload: dict, user: User = Depends(get_current_u
 async def send_notification_to_user(
     user_id: str,
     payload: dict,
-    user: User = Depends(get_current_user),
+    is_admin: bool = Depends(verify_admin),
     db: Session = Depends(get_db)
 ):
     """Send notification to a specific user"""
@@ -1403,7 +1415,7 @@ async def send_notification_to_user(
 @app.post("/api/admin/notify/all")
 async def send_notification_to_all(
     payload: dict,
-    user: User = Depends(get_current_user),
+    is_admin: bool = Depends(verify_admin),
     db: Session = Depends(get_db)
 ):
     """Send notification to all users with push tokens"""
@@ -1425,8 +1437,31 @@ async def send_notification_to_all(
     result["total_users"] = len(tokens)
     return result
 
+@app.get("/api/admin/metrics")
+def get_admin_metrics(is_admin: bool = Depends(verify_admin), db: Session = Depends(get_db)):
+    """Get system-wide metrics"""
+    total_users = db.query(NearishUser).count()
+    total_memories = db.query(Memory).count()
+    total_sessions = db.query(CoupleGameSession).count()
+    total_answers = db.query(UserQuestionAnswer).count()
+    
+    # Calculate active users (last 7 days)
+    seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
+    active_users = db.query(NearishUser).filter(NearishUser.updatedAt >= seven_days_ago).count()
+
+    return {
+        "success": True,
+        "data": {
+            "totalUsers": total_users,
+            "activeUsers": active_users,
+            "totalMemories": total_memories,
+            "totalGameSessions": total_sessions,
+            "totalQuestionsAnswered": total_answers
+        }
+    }
+
 @app.get("/api/admin/users")
-def get_all_users(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def get_all_users(is_admin: bool = Depends(verify_admin), db: Session = Depends(get_db)):
     """Get all users"""
     users = db.query(NearishUser).all()
     return {
@@ -1443,6 +1478,13 @@ def get_all_users(user: User = Depends(get_current_user), db: Session = Depends(
             for u in users
         ]
     }
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_dashboard():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    template_path = os.path.join(base_dir, "templates", "admin_dashboard.html")
+    with open(template_path, "r") as f:
+        return f.read()
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
